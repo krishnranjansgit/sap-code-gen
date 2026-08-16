@@ -10,8 +10,10 @@ Two ways to use this:
 
 ## One-time setup
 
-1. **Install Claude Code** if you haven't already, and confirm `git` and
-   `gh` (GitHub CLI, authenticated — `gh auth status`) are installed.
+1. **Prerequisites**: Python **3.10+** (required by Streamlit/the MCP SDK —
+   check with `python3 --version`), plus `git` and `gh` (GitHub CLI,
+   authenticated — `gh auth status`). Install Claude Code if you haven't
+   already.
 
 2. **Clone this repo**, then run the interactive setup:
    ```bash
