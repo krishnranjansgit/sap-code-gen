@@ -1,0 +1,33 @@
+# Machine-specific config written by setup.py -- never commit real values
+.env
+sap_systems.json
+
+# Vendored SAP RFC MCP server: its own venv + real credentials
+sap-rfc-mcp/.venv/
+sap-rfc-mcp/.env
+sap-rfc-mcp/__pycache__/
+
+# Generated code output (personal working files, not source)
+generated/*
+!generated/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# macOS
+.DS_Store
+
+# Runtime logs / debug artifacts
+*.log
+
+# Personal local Claude Code settings (not shared)
+.claude/settings.local.json
+
+# Auto-created by Streamlit itself (symlinks into the local Python install)
+.agents/
+.claude/skills/
