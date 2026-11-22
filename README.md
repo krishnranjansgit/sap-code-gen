@@ -21,6 +21,12 @@ installs a dedicated connector environment at build time.
 
 ## Requirements workflow
 
+For a shared link with no visitor API credentials, enable server-managed shared
+mode as described in [DEPLOYMENT.md](DEPLOYMENT.md#shared-link-without-visitor-api-credentials).
+The owner configures the model once; credential fields and publishing are hidden.
+Jira/Confluence reads require exact owner-configured allowlists. Personal mode
+below remains the default.
+
 1. Enter your individual model API key and model/deployment name in the
    sidebar. Anthropic, OpenAI, Azure OpenAI and Google Gemini are supported. Azure also needs
    its resource endpoint; API version is `2024-10-21`. Web subscriptions do
@@ -62,12 +68,18 @@ No local filesystem/repository picker or Git/SAP deployment control is exposed.
 
 ## Connections and data
 
-Credentials are masked and held only in the server's Streamlit session, not
+In personal mode, credentials are masked and held only in the server's Streamlit session, not
 written to `.env` or configuration files. Clearing connection settings removes
 credentials, context and saved-file links, not files already on disk. Each
 browser session has a separate random artifact directory. Model requests
 contain requirements and conversation text, not the connection settings.
 Use only public/synthetic material authorized for your selected provider.
+
+Shared mode reads owner-managed credentials from server environment variables,
+not visitor widgets. Conversations and artifacts remain separate per browser
+session. All visitors consume the owner's model quota; an instance-wide hourly
+limit defaults to 30 attempts. This does not replace authentication or durable
+abuse controls. No shared history or credential browser is exposed.
 
 The app does not connect to SAP and requires no SAP endpoint or access token.
 Download generated files and import them into your SAP system manually.

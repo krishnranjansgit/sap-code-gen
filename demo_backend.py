@@ -6,7 +6,10 @@ import os
 import re
 import shutil
 import tempfile
+import time
+from collections import deque
 from datetime import timedelta
+from threading import Lock
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
@@ -31,6 +34,49 @@ Never include credentials in output. Do not reproduce personal data unnecessaril
 """
 
 ATLASSIAN_TOOLS = {"jira_get_issue", "confluence_get_page", "confluence_search"}
+SHARED_REQUESTS = deque()
+SHARED_REQUEST_LOCK = Lock()
+
+
+def shared_mode() -> bool:
+    return os.environ.get("SAP_CODEGEN_SHARED_MODE", "").lower() == "true"
+
+
+def connection_settings(session_settings: dict) -> dict:
+    if not shared_mode():
+        return dict(session_settings)
+    fields = {
+        "llm_provider": "LLM_PROVIDER", "llm_model": "LLM_MODEL",
+        "llm_token": "LLM_API_KEY", "llm_endpoint": "LLM_ENDPOINT",
+        "jira_url": "JIRA_URL", "jira_email": "JIRA_EMAIL", "jira_token": "JIRA_API_TOKEN",
+        "wiki_url": "CONFLUENCE_URL", "wiki_email": "CONFLUENCE_EMAIL",
+        "wiki_token": "CONFLUENCE_API_TOKEN",
+    }
+    return {f"demo_{field}": os.environ.get(f"SAP_CODEGEN_{variable}", "")
+            for field, variable in fields.items()}
+
+
+def shared_allowlist(resource: str) -> set[str]:
+    return {value.strip() for value in os.environ.get(f"SAP_CODEGEN_ALLOWED_{resource}", "").split(",")
+            if value.strip()}
+
+
+def reserve_shared_request() -> None:
+    if not shared_mode():
+        return
+    try:
+        limit = int(os.environ.get("SAP_CODEGEN_REQUESTS_PER_HOUR", "30"))
+        if not 1 <= limit <= 1000:
+            raise ValueError
+    except ValueError:
+        raise RuntimeError("The owner must configure a request limit between 1 and 1000.") from None
+    with SHARED_REQUEST_LOCK:
+        now = time.monotonic()
+        while SHARED_REQUESTS and SHARED_REQUESTS[0] <= now - 3600:
+            SHARED_REQUESTS.popleft()
+        if len(SHARED_REQUESTS) >= limit:
+            raise RuntimeError("The shared demo has reached its hourly request limit. Try again later.")
+        SHARED_REQUESTS.append(now)
 
 
 def atlassian_command() -> tuple[str, list[str]]:
@@ -158,6 +204,11 @@ async def _fetch_context(settings: dict, ticket_key: str, reference: str) -> dic
     validate_settings(settings, require_llm=False)
     if not re.fullmatch(r"[A-Z][A-Z0-9_]*-\d+", ticket_key):
         raise RuntimeError("Enter a valid Jira ticket key, for example KAN-4.")
+    if shared_mode():
+        if ticket_key not in shared_allowlist("TICKETS"):
+            raise RuntimeError("This ticket is not available in the shared demo.")
+        if reference and page_id(reference, cloud_url(settings["demo_wiki_url"], "Wiki")) not in shared_allowlist("PAGES"):
+            raise RuntimeError("This design page is not available in the shared demo.")
     launcher, arguments = atlassian_command()
     with tempfile.TemporaryDirectory(prefix="sap-demo-mcp-") as directory, open(os.devnull, "w") as error_log:
         parameters = StdioServerParameters(
@@ -182,6 +233,8 @@ async def _fetch_context(settings: dict, ticket_key: str, reference: str) -> dic
                 ticket = await call_read_tool(session, tools, "jira_get_issue", arguments)
                 wiki_url = cloud_url(settings["demo_wiki_url"], "Wiki")
                 identifiers = [page_id(reference, wiki_url)] if reference else linked_pages(ticket, wiki_url)
+                if shared_mode() and any(identifier not in shared_allowlist("PAGES") for identifier in identifiers):
+                    raise RuntimeError("A linked design page is not available in the shared demo. Select an approved page explicitly.")
                 if len(identifiers) > 3:
                     raise RuntimeError("More than three design pages are linked. Select one with the wiki page field.")
                 pages = []
@@ -195,6 +248,7 @@ async def _fetch_context(settings: dict, ticket_key: str, reference: str) -> dic
 
 
 def fetch_context(settings: dict, ticket_key: str, reference: str = "") -> dict:
+    settings = connection_settings(settings)
     try:
         return asyncio.run(asyncio.wait_for(_fetch_context(settings, ticket_key, reference), timeout=180))
     except RuntimeError:
@@ -204,7 +258,9 @@ def fetch_context(settings: dict, ticket_key: str, reference: str = "") -> dict:
 
 
 def generate_reply(settings: dict, prompt: str, history: list, context: dict, *, system_prompt: str = SYSTEM_PROMPT) -> str:
+    settings = connection_settings(settings)
     validate_llm_settings(settings)
+    reserve_shared_request()
     context_text = json.dumps(context, ensure_ascii=True)
     if len(context_text) > 100000:
         raise RuntimeError("Ticket/design context is too large. Use a smaller design page.")
@@ -254,6 +310,8 @@ def generate_reply(settings: dict, prompt: str, history: list, context: dict, *,
 
 def publication_parameters(settings: dict, target: str, document: str, *, ticket: str = "",
                            title: str = "", space: str = "", page: str = "", parent: str = "") -> tuple:
+    if shared_mode():
+        raise RuntimeError("Publishing is disabled in the shared demo.")
     validate_settings(settings, require_llm=False)
     if not document.strip() or len(document.encode("utf-8")) > 100000:
         raise RuntimeError("Publish a nonempty finalized specification smaller than 100 KB.")

@@ -69,7 +69,7 @@ filesystem selector in the UI.
 
 ## Data and Verification
 
-Enter individual Atlassian and model credentials only in the session sidebar.
+In personal mode, enter individual Atlassian and model credentials only in the session sidebar.
 Requirements and conversation text are transmitted to the selected LLM provider.
 Only approved public/synthetic data should be used. Generation MCP tools are
 read-only; an explicit publish action launches one write tool for one chosen
@@ -84,3 +84,66 @@ those checks separately in Eclipse ADT against your ABAP Cloud tenant.
 
 Run `python3 -m unittest test_demo_backend -v` before packaging. These tests mock
 providers and Atlassian APIs; they do not prove live credentials or cloud access.
+
+## Shared link without visitor API credentials
+
+Enable shared mode with `SAP_CODEGEN_SHARED_MODE=true` in the server environment.
+Visitors do not enter API credentials or choose the model. Settings are read on
+the server, never placed in widgets or loaded from the legacy `.env`. Personal
+mode remains the default when the flag is absent. Do not bake secrets into the
+image or commit them. Use a dedicated demo account, not your everyday account.
+
+Required server variables:
+
+| Variable | Purpose |
+| --- | --- |
+| `SAP_CODEGEN_LLM_PROVIDER` | `Google Gemini`, `OpenAI`, `Anthropic`, or `Azure OpenAI` |
+| `SAP_CODEGEN_LLM_MODEL` | Your available model or deployment name |
+| `SAP_CODEGEN_LLM_API_KEY` | Model API key, injected from Secret Manager |
+| `SAP_CODEGEN_LLM_ENDPOINT` | Azure resource endpoint, only for Azure |
+| `SAP_CODEGEN_REQUESTS_PER_HOUR` | Model attempts per instance, default 30, range 1-1000 |
+
+Pasted/imported requirements need only the model connection. For Jira/Confluence,
+also set `SAP_CODEGEN_JIRA_URL`, `SAP_CODEGEN_JIRA_EMAIL`,
+`SAP_CODEGEN_JIRA_API_TOKEN`, `SAP_CODEGEN_CONFLUENCE_URL`,
+`SAP_CODEGEN_CONFLUENCE_EMAIL`, and `SAP_CODEGEN_CONFLUENCE_API_TOKEN`.
+Inject both API tokens from Secret Manager. Use read-only, least-privilege
+Atlassian credentials on a site containing approved public/synthetic data only.
+Set `SAP_CODEGEN_ALLOWED_TICKETS` to comma-separated exact keys such as
+`KAN-4,KAN-5`, and `SAP_CODEGEN_ALLOWED_PAGES` to comma-separated numeric
+Confluence IDs such as `425985,425986`. Empty lists deny all reads of that
+resource. Unapproved linked pages are not fetched. Approved ticket content,
+including its comments and link metadata, is visible to visitors. Publishing
+is disabled in both the UI and backend in shared mode.
+
+Create the model secret through Google Cloud Secret Manager's console. Grant
+the dedicated runtime service account `roles/secretmanager.secretAccessor`
+on that secret only. After deploying the image with these changes, an operator
+can configure an existing Cloud Run service without putting the key in commands:
+
+```sh
+gcloud run services update sap-code-gen --region="$REGION" \
+  --update-env-vars='SAP_CODEGEN_SHARED_MODE=true,SAP_CODEGEN_LLM_PROVIDER=Google Gemini,SAP_CODEGEN_LLM_MODEL=gemini-3.5-flash-lite,SAP_CODEGEN_REQUESTS_PER_HOUR=30' \
+  --update-secrets=SAP_CODEGEN_LLM_API_KEY=sap-codegen-llm-key:1
+```
+
+Use the authenticated external browser access described above for trusted users;
+they may sign in for access but need no Atlassian or model API credentials.
+For an intentionally anonymous, public/synthetic-only demonstration, the
+operator may explicitly grant public invocation instead:
+
+```sh
+gcloud run services add-iam-policy-binding sap-code-gen --region="$REGION" \
+  --member=allUsers --role=roles/run.invoker
+gcloud run services describe sap-code-gen --region="$REGION" --format='value(status.url)'
+```
+
+The resulting HTTPS URL is the shareable link; localhost is not shareable.
+Anyone with public access can consume your quota and see approved source data.
+The hourly model limiter is shared across sessions in one process, counts
+failed API attempts, and resets on process restart; it is not a durable billing
+or abuse-control boundary. Keep `--max-instances 1`, apply provider-enforced
+quotas and billing alerts, and use authenticated access plus durable rate
+limiting for production. Retrieval is not rate-limited by the model limiter.
+Organization policy may prohibit anonymous invocation. Cloud deployment and
+live secret injection have not been validated by the mocked tests.

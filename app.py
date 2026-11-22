@@ -18,6 +18,7 @@ from datetime import datetime
 
 import streamlit as st
 from demo_backend import fetch_context, generate_reply, validate_settings, validate_llm_settings
+from demo_backend import connection_settings as resolve_connection_settings, shared_mode, shared_allowlist
 from prompts import requirements_prompt, codegen_prompt
 
 # ------------------------------------------------------------------
@@ -31,7 +32,7 @@ GENERATED_DIR = os.environ.get("ARTIFACT_DIR", GENERATED_DIR)
 # Session connections
 # ------------------------------------------------------------------
 def connection_settings() -> dict:
-    return {key: value for key, value in st.session_state.items() if key.startswith("demo_")}
+    return resolve_connection_settings({key: value for key, value in st.session_state.items() if key.startswith("demo_")})
 
 
 def reset_session():
@@ -200,6 +201,17 @@ for state_key, default in {
     if state_key not in st.session_state:
         st.session_state[state_key] = default
 
+if shared_mode():
+    shared_identity = json.dumps([connection_settings(), sorted(shared_allowlist("TICKETS")),
+                                  sorted(shared_allowlist("PAGES"))], sort_keys=True)
+    shared_fingerprint = hashlib.sha256(shared_identity.encode()).hexdigest()
+    if st.session_state.get("shared_configuration") != shared_fingerprint:
+        reset_session()
+        st.session_state.shared_configuration = shared_fingerprint
+elif "shared_configuration" in st.session_state:
+    reset_session()
+    del st.session_state["shared_configuration"]
+
 
 def show_spec(document: str):
     sections = re.split(r"(?m)^##\s+", document)
@@ -321,35 +333,38 @@ def send_message(text: str, ticket: str = "", reference: str = ""):
 
 
 with st.sidebar:
-    st.markdown("### Demo Connections")
-    st.caption("Session-only credentials. Writes require explicit confirmation.")
-    with st.expander("Jira Cloud", expanded=True):
-        st.text_input("Jira URL", placeholder="https://your-site.atlassian.net", key="demo_jira_url", on_change=reset_session)
-        st.text_input("Jira account email", placeholder="you@example.com", key="demo_jira_email", on_change=reset_session)
-        st.text_input("Jira API token", type="password", placeholder="Enter Jira API token", key="demo_jira_token", on_change=reset_session)
-    with st.expander("Wiki / Confluence", expanded=True):
-        st.text_input("Wiki URL", placeholder="https://your-site.atlassian.net/wiki", key="demo_wiki_url", on_change=reset_session)
-        st.text_input("Wiki account email", placeholder="you@example.com", key="demo_wiki_email", on_change=reset_session)
-        st.text_input("Wiki API token", type="password", placeholder="Enter Confluence API token", key="demo_wiki_token", on_change=reset_session)
-    with st.expander("LLM", expanded=True):
-        provider = st.selectbox("LLM provider", ["Anthropic", "OpenAI", "Azure OpenAI", "Google Gemini"], key="demo_llm_provider", on_change=reset_session)
-        st.text_input("LLM API token", type="password", placeholder="Enter provider API key", key="demo_llm_token", on_change=reset_session)
-        st.text_input("Model / deployment name", placeholder="claude-sonnet-4-5, gpt-4.1 or gemini-3.8-flash", key="demo_llm_model", on_change=reset_session)
-        if provider == "Azure OpenAI":
-            st.text_input("Azure OpenAI endpoint", placeholder="https://your-resource.openai.azure.com", key="demo_llm_endpoint", on_change=reset_session)
-        if st.button("Test LLM (API request)", key="test_llm", width="stretch"):
-            try:
-                with st.spinner("Checking LLM..."):
-                    generate_reply(connection_settings(), "Reply with OK only.", [], {})
-                st.success("LLM returned text successfully.")
-            except RuntimeError as error:
-                st.error(str(error))
-    if st.button("Clear connection settings", width="stretch"):
-        for connection_key in list(st.session_state):
-            if connection_key.startswith("demo_"):
-                del st.session_state[connection_key]
-        reset_session()
-        st.rerun()
+    if shared_mode():
+        st.markdown("### Shared demo")
+    else:
+        st.markdown("### Demo Connections")
+        st.caption("Session-only credentials. Writes require explicit confirmation.")
+        with st.expander("Jira Cloud", expanded=True):
+            st.text_input("Jira URL", placeholder="https://your-site.atlassian.net", key="demo_jira_url", on_change=reset_session)
+            st.text_input("Jira account email", placeholder="you@example.com", key="demo_jira_email", on_change=reset_session)
+            st.text_input("Jira API token", type="password", placeholder="Enter Jira API token", key="demo_jira_token", on_change=reset_session)
+        with st.expander("Wiki / Confluence", expanded=True):
+            st.text_input("Wiki URL", placeholder="https://your-site.atlassian.net/wiki", key="demo_wiki_url", on_change=reset_session)
+            st.text_input("Wiki account email", placeholder="you@example.com", key="demo_wiki_email", on_change=reset_session)
+            st.text_input("Wiki API token", type="password", placeholder="Enter Confluence API token", key="demo_wiki_token", on_change=reset_session)
+        with st.expander("LLM", expanded=True):
+            provider = st.selectbox("LLM provider", ["Anthropic", "OpenAI", "Azure OpenAI", "Google Gemini"], key="demo_llm_provider", on_change=reset_session)
+            st.text_input("LLM API token", type="password", placeholder="Enter provider API key", key="demo_llm_token", on_change=reset_session)
+            st.text_input("Model / deployment name", placeholder="claude-sonnet-4-5, gpt-4.1 or gemini-3.8-flash", key="demo_llm_model", on_change=reset_session)
+            if provider == "Azure OpenAI":
+                st.text_input("Azure OpenAI endpoint", placeholder="https://your-resource.openai.azure.com", key="demo_llm_endpoint", on_change=reset_session)
+            if st.button("Test LLM (API request)", key="test_llm", width="stretch"):
+                try:
+                    with st.spinner("Checking LLM..."):
+                        generate_reply(connection_settings(), "Reply with OK only.", [], {})
+                    st.success("LLM returned text successfully.")
+                except RuntimeError as error:
+                    st.error(str(error))
+        if st.button("Clear connection settings", width="stretch"):
+            for connection_key in list(st.session_state):
+                if connection_key.startswith("demo_"):
+                    del st.session_state[connection_key]
+            reset_session()
+            st.rerun()
 
     st.divider()
     if st.button("🔄 New ticket / reset session", width="stretch"):
@@ -362,7 +377,7 @@ try:
     generation_blocker = ""
 except RuntimeError as error:
     chat_ready = False
-    generation_blocker = str(error)
+    generation_blocker = "The owner must configure the server's model connection." if shared_mode() else str(error)
 except ValueError:
     chat_ready = False
     generation_blocker = "The LLM endpoint URL is invalid."
@@ -372,8 +387,9 @@ requirements_tab, code_tab = st.tabs(["Requirements", "Code generation"])
 with requirements_tab:
     st.subheader("Requirements refinement")
     st.markdown("#### 1. Fetch & summarize")
-    source_mode = st.segmented_control("Requirement source", ["Jira / wiki", "Pasted requirement"],
-                                       default="Jira / wiki", key="source_mode", on_change=reset_session)
+    sources = ["Jira / wiki", "Pasted requirement"] if not shared_mode() or shared_allowlist("TICKETS") else ["Pasted requirement"]
+    source_mode = st.segmented_control("Requirement source", sources,
+                                       default=sources[0], key="source_mode", on_change=reset_session)
     if source_mode == "Jira / wiki":
         wiki_page = st.text_input(
             "Wiki / Confluence page (optional)",
@@ -451,6 +467,7 @@ with requirements_tab:
         st.success("Finalized specification ready for code generation.")
         st.download_button("Download specification", st.session_state.final_requirement,
                            file_name=f"{st.session_state.ticket_key or 'requirement'}_spec.md", mime="text/markdown")
+    if st.session_state.final_requirement and not shared_mode():
         with st.expander("Publish finalized requirement"):
             from demo_backend import publish_requirement
             target = st.selectbox("Publish target", ["Jira comment", "Replace Jira description", "New Confluence page", "Update Confluence page"], key="publish_target")

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from contextlib import asynccontextmanager
@@ -25,6 +26,59 @@ SETTINGS = {
     "demo_llm_model": "gpt-4.1",
 }
 REPLY = "## Ticket Summary\nDemo\n## Classification\nABAP\n## Code\n```abap\n* Z_DEMO.clas.abap\nCLASS z_demo DEFINITION PUBLIC.\nENDCLASS.\n```\n## Notes\nNot activated."
+
+
+class SharedBackendTests(unittest.TestCase):
+    def environment(self):
+        return {"SAP_CODEGEN_SHARED_MODE": "true", **{
+            "SAP_CODEGEN_" + name: SETTINGS[key] for name, key in {
+                "LLM_PROVIDER": "demo_llm_provider", "LLM_MODEL": "demo_llm_model",
+                "LLM_API_KEY": "demo_llm_token", "JIRA_URL": "demo_jira_url",
+                "JIRA_EMAIL": "demo_jira_email", "JIRA_API_TOKEN": "demo_jira_token",
+                "CONFLUENCE_URL": "demo_wiki_url", "CONFLUENCE_EMAIL": "demo_wiki_email",
+                "CONFLUENCE_API_TOKEN": "demo_wiki_token",
+            }.items()}}
+
+    def test_shared_settings_ignore_visitor_credentials(self):
+        with patch.dict(os.environ, self.environment(), clear=True):
+            settings = backend.connection_settings({"demo_llm_token": "visitor-token"})
+            self.assertEqual(settings["demo_llm_token"], SETTINGS["demo_llm_token"])
+            self.assertNotIn("visitor-token", json.dumps(settings))
+
+    def test_shared_reads_fail_closed_before_connector_launch(self):
+        with patch.dict(os.environ, self.environment(), clear=True), patch.object(backend, "atlassian_command") as launcher:
+            with self.assertRaisesRegex(RuntimeError, "ticket is not available"):
+                backend.fetch_context({}, "KAN-4")
+            os.environ["SAP_CODEGEN_ALLOWED_TICKETS"] = "KAN-4"
+            with self.assertRaisesRegex(RuntimeError, "page is not available"):
+                backend.fetch_context({}, "KAN-4", "425985")
+            launcher.assert_not_called()
+
+    def test_shared_publishing_is_blocked_in_backend(self):
+        with patch.dict(os.environ, self.environment(), clear=True), patch.object(backend, "_publish_requirement") as publish:
+            with self.assertRaisesRegex(RuntimeError, "Publishing is disabled"):
+                backend.publish_requirement(SETTINGS, "Jira comment", "Approved", ticket="KAN-4")
+            publish.assert_not_called()
+
+    def test_shared_limit_is_global_and_expires(self):
+        from collections import deque
+        with patch.dict(os.environ, {**self.environment(), "SAP_CODEGEN_REQUESTS_PER_HOUR": "1"}, clear=True), patch.object(backend, "SHARED_REQUESTS", deque()), patch.object(backend.time, "monotonic", return_value=0) as clock:
+            backend.reserve_shared_request()
+            with self.assertRaisesRegex(RuntimeError, "hourly request limit"):
+                backend.reserve_shared_request()
+            clock.return_value = 3600
+            backend.reserve_shared_request()
+            self.assertEqual(len(backend.SHARED_REQUESTS), 1)
+
+    def test_shared_approved_ticket_and_linked_page_can_be_read(self):
+        with patch.dict(os.environ, {**self.environment(), "SAP_CODEGEN_ALLOWED_TICKETS": "KAN-4", "SAP_CODEGEN_ALLOWED_PAGES": "425985"}, clear=True):
+            BackendTests().test_context_uses_discovered_schema_and_follows_design()
+
+    def test_shared_unapproved_linked_page_is_not_fetched(self):
+        with patch.dict(os.environ, {**self.environment(), "SAP_CODEGEN_ALLOWED_TICKETS": "KAN-4"}, clear=True), patch.object(backend, "call_read_tool", wraps=backend.call_read_tool) as call:
+            with self.assertRaisesRegex(RuntimeError, "linked design page is not available"):
+                BackendTests().test_context_uses_discovered_schema_and_follows_design()
+            self.assertEqual([invocation.args[2] for invocation in call.call_args_list], ["jira_get_issue"])
 
 
 class PromptTests(unittest.TestCase):
@@ -231,6 +285,28 @@ class BackendTests(unittest.TestCase):
             backend.publication_parameters(SETTINGS, "New Confluence page", "Approved spec", title="Design", space="A display name")
 
 class DemoUITests(unittest.TestCase):
+    def test_shared_mode_needs_no_visitor_credentials_and_keeps_sessions_separate(self):
+        with patch.dict(os.environ, SharedBackendTests().environment(), clear=True), patch.object(backend, "generate_reply", return_value="## Requirement\nSynthetic demo") as generate:
+            app = AppTest.from_file("app.py").run()
+            other = AppTest.from_file("app.py").run()
+            self.assertFalse(app.exception)
+            self.assertFalse(any(field.key.startswith("demo_") for field in app.text_input))
+            self.assertFalse(any(button.key == "test_llm" for button in app.button))
+            self.assertNotEqual(app.session_state["workspace_id"], other.session_state["workspace_id"])
+            app.text_area(key="pasted_requirement").set_value("Synthetic console demo").run()
+            app.button(key="summarize").click().run()
+            self.assertFalse(app.exception)
+            self.assertEqual(generate.call_args.args[0]["demo_llm_token"], SETTINGS["demo_llm_token"])
+            self.finalize(app)
+            self.assertFalse(app.button(key="generate").disabled)
+            self.assertFalse(any(button.key == "publish" for button in app.button))
+            self.assertFalse(any(key.startswith("demo_") for key in app.session_state.filtered_state))
+            self.assertNotIn(SETTINGS["demo_llm_token"], str(app))
+            os.environ["SAP_CODEGEN_LLM_MODEL"] = "different-model"
+            app.run()
+            self.assertFalse(app.session_state["final_requirement"])
+            self.assertTrue(app.button(key="generate").disabled)
+
     def configured_app(self, output_directory=None):
         if output_directory:
             source = Path("app.py").read_text().replace(
