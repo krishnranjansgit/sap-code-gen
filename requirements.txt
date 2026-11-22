@@ -1,2 +1,5 @@
-streamlit>=1.38
-python-dotenv>=1.0
+streamlit>=1.49,<2
+mcp>=1.26,<2
+httpx>=0.28,<1
+anthropic>=0.75,<1
+openai>=2,<3

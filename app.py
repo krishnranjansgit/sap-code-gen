@@ -1,9 +1,7 @@
 """
 SAP Code Generator — UI
 ------------------------
-A local web UI (Streamlit) that drives Claude Code in headless "print mode"
-as a subprocess — no API key, no terminal typing. Runs on your Claude
-subscription via a long-lived token (see README for one-time setup).
+A local Streamlit UI with session-scoped Cloud MCP and LLM connections.
 
 Run with:
     streamlit run app.py
@@ -12,245 +10,71 @@ Run with:
 import os
 import re
 import json
-import signal
-import socket
-import subprocess
-import time
+import hashlib
+import io
+import uuid
+import zipfile
 from datetime import datetime
 
 import streamlit as st
-from dotenv import load_dotenv
+from demo_backend import fetch_context, generate_reply, validate_settings, validate_llm_settings
+from prompts import requirements_prompt, codegen_prompt
 
 # ------------------------------------------------------------------
 # CONFIG
 # ------------------------------------------------------------------
-# This should be the folder containing CLAUDE.md and .claude/commands/
-# (i.e. this same project folder) so Claude Code picks up your
-# conventions and slash command automatically.
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 GENERATED_DIR = os.path.join(PROJECT_DIR, "generated")
-
-# All machine-specific config comes from .env + sap_systems.json (both
-# gitignored, both written by `python3 setup.py`) -- nothing here should
-# be hardcoded to any one person's laptop/paths/MCP server names.
-load_dotenv(os.path.join(PROJECT_DIR, ".env"))
-
-# check_abapgit_repo.py / export_to_abapgit.py reach into this sibling
-# directory (outside PROJECT_DIR), which Claude Code's Bash sandbox blocks
-# by default -- --add-dir in run_claude() below is what grants access.
-ABAPGIT_REPO_DIR = os.environ.get("ABAPGIT_REPO_DIR", "")
-
-# abap-accelerator is a standalone HTTP MCP server (unlike the stdio
-# servers Claude Code spawns itself) -- each SAP system runs as its own
-# instance (own port, own .env) and is started/stopped manually from the
-# sidebar. See "SAP system lifecycle" below.
-ABAP_ACCELERATOR_DIR = os.environ.get("ABAP_ACCELERATOR_DIR", "")
-ABAP_ACCELERATOR_HOST = "127.0.0.1"
-
-JIRA_WIKI_MCP_NAME = os.environ.get("JIRA_WIKI_MCP_NAME", "mcp-atlassian")
-SAP_RFC_MCP_NAME = os.environ.get("SAP_RFC_MCP_NAME", "sap-rfc")
-
-
-def _load_sap_systems() -> dict:
-    """Load SAP system definitions from sap_systems.json (see
-    sap_systems.json.example). Returns {} if not configured yet --
-    the UI shows a clear "run setup.py" prompt rather than crashing."""
-    path = os.path.join(PROJECT_DIR, "sap_systems.json")
-    if not os.path.exists(path):
-        return {}
-    with open(path) as f:
-        raw = json.load(f)
-    systems = {}
-    for key, cfg in raw.items():
-        systems[key] = {
-            **cfg,
-            "dir": os.path.join(ABAP_ACCELERATOR_DIR, "instances", key),
-            "log": f"/tmp/abap_{key}.log",
-        }
-    return systems
-
-
-SAP_SYSTEMS = _load_sap_systems()
-
-# Tool permissions for headless runs (no interactive terminal to approve
-# prompts). Names come from JIRA_WIKI_MCP_NAME/SAP_RFC_MCP_NAME/
-# sap_systems.json -- must match whatever you used in `claude mcp add
-# <name> ...` (setup.py handles this for you).
-ALLOWED_TOOLS = [
-    f"mcp__{JIRA_WIKI_MCP_NAME}__*",
-    f"mcp__{SAP_RFC_MCP_NAME}__*",
-    "Read",
-    "Write",
-    # confluence_search.py / confluence_get_page.py work around the same
-    # bug in mcp-atlassian's own confluence_search / confluence_get_page
-    # tools (both error against this Confluence Server/DC instance) by
-    # hitting the working REST endpoints directly. Scoped to just these
-    # two scripts — not general Bash access.
-    "Bash(python3 confluence_search.py:*)",
-    "Bash(python3 confluence_get_page.py:*)",
-    # Read-only inspection of the abapGit repo (log/status/file listing) --
-    # no push/write capability. Pushing stays a manual sidebar-button action.
-    "Bash(python3 check_abapgit_repo.py:*)",
-] + [
-    # abap-accelerator (one per configured SAP system): proper ADT-backed
-    # SAP tooling. Deliberately scoped to read-only tools only --
-    # create/update/activate tools exist on this server but are
-    # intentionally NOT allowed here.
-    f"mcp__{cfg['mcp_name']}__{tool}"
-    for cfg in SAP_SYSTEMS.values()
-    for tool in [
-        "aws_abap_cb_connection_status",
-        "aws_abap_cb_get_objects",
-        "aws_abap_cb_get_source",
-        "aws_abap_cb_search_object",
-        "aws_abap_cb_get_test_classes",
-        "aws_abap_cb_get_migration_analysis",
-        "aws_abap_cb_get_transport_requests",
-        "aws_abap_cb_check_syntax",
-        "aws_abap_cb_run_atc_check",
-    ]
-]
-
-CLAUDE_TIMEOUT_SECONDS = 600
-
+GENERATED_DIR = os.environ.get("ARTIFACT_DIR", GENERATED_DIR)
 
 # ------------------------------------------------------------------
-# Claude Code subprocess wrapper
+# Session connections
 # ------------------------------------------------------------------
-def run_claude(prompt: str, resume_session_id: str = None) -> dict:
-    """Call Claude Code headlessly and return its parsed JSON response.
-    Raises RuntimeError with stderr content on failure."""
-    cmd = [
-        "claude", "-p", prompt,
-        "--output-format", "json",
-        "--allowedTools", *ALLOWED_TOOLS,
-    ]
-    if ABAPGIT_REPO_DIR:
-        cmd += ["--add-dir", ABAPGIT_REPO_DIR]
-    if resume_session_id:
-        cmd += ["--resume", resume_session_id]
-
-    result = subprocess.run(
-        cmd,
-        cwd=PROJECT_DIR,
-        capture_output=True,
-        text=True,
-        timeout=CLAUDE_TIMEOUT_SECONDS,
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(f"claude exited {result.returncode}: {result.stderr.strip()}")
-
-    try:
-        return json.loads(result.stdout)
-    except json.JSONDecodeError:
-        raise RuntimeError(f"Could not parse Claude Code output as JSON:\n{result.stdout}")
+def connection_settings() -> dict:
+    return {key: value for key, value in st.session_state.items() if key.startswith("demo_")}
 
 
-# ------------------------------------------------------------------
-# SAP system lifecycle (each is a standalone HTTP MCP server process,
-# not spawned by Claude Code itself -- started/stopped manually here)
-# ------------------------------------------------------------------
-def _port_open(host: str, port: int, timeout: float = 0.5) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
+def reset_session():
+    for key in list(st.session_state):
+        if key.startswith(("requirement_editor_", "approve_", "publish_confirm_")):
+            del st.session_state[key]
+    st.session_state.session_id = None
+    st.session_state.ticket_key = None
+    st.session_state.iteration = 0
+    st.session_state.history = []
+    st.session_state.context = {}
+    st.session_state.last_saved = []
+    st.session_state.workspace_id = uuid.uuid4().hex
+    st.session_state.requirement_history = []
+    st.session_state.requirement_draft = ""
+    st.session_state.final_requirement = ""
+    st.session_state.requirement_iteration = 0
 
 
-def _pid_on_port(port: int):
-    """Find the PID of whatever's listening on a local port, if any.
-    Looked up live (not tracked in session state) so Stop/Restart work
-    correctly even after a Streamlit restart."""
-    try:
-        out = subprocess.run(
-            ["lsof", "-ti", f":{port}"], capture_output=True, text=True, timeout=5
-        )
-        pids = [p for p in out.stdout.split() if p]
-        return int(pids[0]) if pids else None
-    except Exception:
-        return None
+def invalidate_approval():
+    st.session_state.final_requirement = ""
+    st.session_state.history = []
+    st.session_state.iteration = 0
+    st.session_state.last_saved = []
 
 
-def _parse_env_file(path: str) -> dict:
-    env_vars = {}
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            env_vars[key.strip()] = value.strip()
-    return env_vars
+def requirement_edited(editor_key: str):
+    st.session_state.requirement_draft = st.session_state[editor_key]
+    invalidate_approval()
 
 
-def start_sap_system(key: str, wait_seconds: float = 15) -> bool:
-    """Start a SAP system's abap-accelerator instance if not already
-    running. Returns True if it's up by the time this returns."""
-    cfg = SAP_SYSTEMS[key]
-    if _port_open(ABAP_ACCELERATOR_HOST, cfg["port"]):
-        return True
-
-    env_file = os.path.join(cfg["dir"], ".env")
-    venv_python = os.path.join(ABAP_ACCELERATOR_DIR, ".venv", "bin", "python3")
-    main_script = os.path.join(ABAP_ACCELERATOR_DIR, "src", "aws_abap_accelerator", "main.py")
-    if not (os.path.exists(venv_python) and os.path.exists(main_script) and os.path.exists(env_file)):
-        return False
-
-    # Passed as real env vars rather than relying on main.py's own
-    # load_dotenv(), which searches upward from its own script location
-    # (not the cwd) and so can't find per-instance .env files here.
-    env = os.environ.copy()
-    env.update(_parse_env_file(env_file))
-    env["PYTHONPATH"] = os.path.join(ABAP_ACCELERATOR_DIR, "src")
-    with open(cfg["log"], "a") as log:
-        subprocess.Popen(
-            [venv_python, main_script],
-            cwd=cfg["dir"],
-            env=env,
-            stdout=log,
-            stderr=log,
-            start_new_session=True,
-        )
-
-    deadline = time.time() + wait_seconds
-    while time.time() < deadline:
-        if _port_open(ABAP_ACCELERATOR_HOST, cfg["port"]):
-            return True
-        time.sleep(0.5)
-    return False
-
-
-def stop_sap_system(key: str, wait_seconds: float = 5) -> bool:
-    """Stop a SAP system's abap-accelerator instance. Returns True if
-    it's confirmed stopped by the time this returns."""
-    cfg = SAP_SYSTEMS[key]
-    pid = _pid_on_port(cfg["port"])
-    if pid:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-
-    deadline = time.time() + wait_seconds
-    while time.time() < deadline:
-        if not _port_open(ABAP_ACCELERATOR_HOST, cfg["port"]):
-            return True
-        time.sleep(0.3)
-    return not _port_open(ABAP_ACCELERATOR_HOST, cfg["port"])
-
-
-def restart_sap_system(key: str) -> bool:
-    stop_sap_system(key)
-    return start_sap_system(key)
+def approval_changed(approval_key: str):
+    if not st.session_state[approval_key]:
+        invalidate_approval()
 
 
 # ------------------------------------------------------------------
 # Parsing + saving generated code
 # ------------------------------------------------------------------
 def save_generated_files(ticket_key: str, raw_text: str, iteration: int):
-    ticket_dir = os.path.join(GENERATED_DIR, ticket_key)
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", ticket_key):
+        raise RuntimeError("Invalid output folder name.")
+    ticket_dir = os.path.join(GENERATED_DIR, st.session_state.workspace_id, ticket_key)
     os.makedirs(ticket_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -265,7 +89,7 @@ def save_generated_files(ticket_key: str, raw_text: str, iteration: int):
         blocks = re.findall(r"```[\w-]*\n(.*?)```", code_section.group(1), re.DOTALL)
         for i, block in enumerate(blocks, start=1):
             first_line = block.strip().splitlines()[0] if block.strip() else ""
-            m = re.search(r"([A-Za-z0-9_\-/]+\.\w+)", first_line)
+            m = re.search(r"([A-Za-z0-9_\-/]+(?:\.[A-Za-z0-9_]+)+)", first_line)
             filename = (m.group(1) if m else f"file{i}.txt").replace("/", "_")
             path = os.path.join(ticket_dir, f"v{iteration}_{filename}")
             with open(path, "w") as f:
@@ -350,7 +174,7 @@ st.markdown(
     </style>
     <div class="app-header">
         <h1>🛠️ SAP Code Generator</h1>
-        <p>Jira + Wiki → Claude Code → ABAP / Fiori code, refined through conversation.</p>
+        <p>Jira Cloud + Confluence + SAP code generation</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -365,143 +189,314 @@ if "iteration" not in st.session_state:
 if "history" not in st.session_state:
     st.session_state.history = []  # list of {"role": "user"/"assistant", "text": ...}
 
+for state_key, default in {
+    "workspace_id": uuid.uuid4().hex,
+    "requirement_history": [],
+    "requirement_draft": "",
+    "final_requirement": "",
+    "requirement_iteration": 0,
+    "context": {},
+}.items():
+    if state_key not in st.session_state:
+        st.session_state[state_key] = default
 
-def send_message(text: str):
-    """Send a message in the current (or a brand-new) session, resuming
-    conversation history so Claude can answer questions or revise code
-    with full context of the ticket/wiki/prior responses."""
-    st.session_state.iteration += 1
-    with st.spinner(f"Thinking (v{st.session_state.iteration})..."):
+
+def show_spec(document: str):
+    sections = re.split(r"(?m)^##\s+", document)
+    if sections[0].strip():
+        st.markdown(sections[0])
+    for section in sections[1:]:
+        heading, _, body = section.partition("\n")
+        with st.expander(heading.strip()):
+            st.markdown(body)
+
+
+def show_source(preview: dict):
+    ticket = preview.get("ticket", {})
+    ticket_key = ticket.get("key") or preview.get("ticket_key", "Ticket")
+    summary = ticket.get("summary") or "Requirement"
+    with st.expander(f"{ticket_key}: {summary}", expanded=True):
+        description = ticket.get("description")
+        if isinstance(description, str) and description.strip():
+            st.markdown(description)
+        else:
+            st.info("No ticket description available.")
+    for page in preview.get("design_pages", []):
+        metadata = page.get("metadata", page)
+        content = page.get("content") or metadata.get("content", "")
+        if isinstance(content, dict):
+            content = content.get("value", "")
+        with st.expander(metadata.get("title") or "Linked design", expanded=True):
+            if isinstance(content, str) and content.strip():
+                st.markdown(content)
+            else:
+                st.info("No design content available.")
+
+
+def refine_message(text: str, fetch: bool = False):
+    with st.spinner("Preparing requirement specification..."):
         try:
-            data = run_claude(text, resume_session_id=st.session_state.session_id)
-            st.session_state.session_id = data.get("session_id", st.session_state.session_id)
-            reply = data.get("result", "")
+            settings = connection_settings()
+            validate_llm_settings(settings)
+            context = dict(st.session_state.context)
+            ticket = st.session_state.ticket_key or ""
+            if fetch and st.session_state.get("source_mode", "Jira / wiki") == "Jira / wiki":
+                ticket = st.session_state.get("ticket_input", "").strip().upper()
+                context = fetch_context(settings, ticket, st.session_state.get("wiki_page", "").strip())
+            elif fetch:
+                source = st.session_state.get("pasted_requirement", "").strip()
+                if not source:
+                    raise RuntimeError("Paste a requirement before summarizing it.")
+                context = {"pasted_requirement": source, "notes": "User-provided content; no SAP objects inspected."}
+                ticket = ""
+            context["current_document"] = "" if fetch else st.session_state.requirement_draft
+            history = [] if fetch else list(st.session_state.requirement_history)
+            reply = generate_reply(settings, text, history, context,
+                                   system_prompt=requirements_prompt(st.session_state.get("review_role", "bsa")))
+            st.session_state.context = context
+            st.session_state.ticket_key = ticket or None
+            st.session_state.requirement_iteration += 1
+            st.session_state.requirement_draft = reply
+            st.session_state.final_requirement = ""
+            st.session_state.requirement_history = history + [
+                {"role": "user", "text": text}, {"role": "assistant", "text": reply},
+            ]
+            st.session_state.history = []
+            st.session_state.iteration = 0
+            st.session_state.last_saved = []
+            st.rerun()
+        except (RuntimeError, ValueError) as error:
+            st.error(str(error) if isinstance(error, RuntimeError) else "A connection URL is invalid.")
+
+
+def finalize_requirement(document: str):
+    try:
+        approval_key = f"approve_{st.session_state.workspace_id}_{st.session_state.requirement_iteration}_" + hashlib.sha256(document.encode()).hexdigest()[:16]
+        if not document.strip() or len(document.encode("utf-8")) > 100000:
+            raise RuntimeError("Approve a nonempty requirement smaller than 100 KB.")
+        if not st.session_state.get(approval_key):
+            raise RuntimeError("Approve the current specification before finalizing it.")
+        save_generated_files(st.session_state.ticket_key or "requirements", document,
+                             st.session_state.requirement_iteration)
+        st.session_state.final_requirement = document
+        st.session_state.requirement_draft = document
+        st.session_state.history = []
+        st.session_state.iteration = 0
+        st.session_state.last_saved = []
+        st.rerun()
+    except RuntimeError as error:
+        st.error(str(error))
+    except OSError:
+        st.error("Could not save the specification. Check output storage permissions.")
+
+
+def send_message(text: str, ticket: str = "", reference: str = ""):
+    """Commit a successful reply with its ticket/design and revision history."""
+    iteration = st.session_state.iteration + 1
+    with st.spinner(f"Thinking (v{iteration})..."):
+        try:
+            settings = connection_settings()
+            validate_llm_settings(settings)
+            if not st.session_state.final_requirement:
+                raise RuntimeError("Finalize and approve the requirement before code generation.")
+            context = dict(st.session_state.get("context", {}))
+            context["finalized_requirement"] = st.session_state.final_requirement
+            context.pop("current_document", None)
+            reply = generate_reply(settings, text, list(st.session_state.history), context,
+                                   system_prompt=codegen_prompt())
+            folder = ticket or st.session_state.ticket_key or "session"
+            saved = save_generated_files(folder, reply, iteration)
+            st.session_state.context = context
+            st.session_state.ticket_key = ticket or st.session_state.ticket_key
+            st.session_state.session_id = "demo"
+            st.session_state.iteration = iteration
             st.session_state.history.append({"role": "user", "text": text})
             st.session_state.history.append({"role": "assistant", "text": reply})
-            folder = st.session_state.ticket_key or "session"
-            saved = save_generated_files(folder, reply, st.session_state.iteration)
             st.session_state.last_saved = saved
             st.rerun()
         except RuntimeError as e:
             st.error(str(e))
+        except OSError:
+            st.error("Could not save generated files. Check permissions and available disk space.")
 
 
 with st.sidebar:
-    st.markdown("### ⚙️ Environment")
-    token_set = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"))
-    if token_set:
-        st.success("CLAUDE_CODE_OAUTH_TOKEN set", icon="✅")
-    else:
-        st.warning("CLAUDE_CODE_OAUTH_TOKEN not set — see README", icon="⚠️")
-
-    st.divider()
-    st.markdown("### 🖥️ SAP Systems")
-    if not SAP_SYSTEMS:
-        st.warning("No SAP systems configured — run `python3 setup.py`", icon="⚠️")
-    for key, cfg in SAP_SYSTEMS.items():
-        running = _port_open(ABAP_ACCELERATOR_HOST, cfg["port"])
-        with st.container(border=True):
-            st.markdown(f"**{cfg['label']}**")
-            st.caption(("🟢 Running" if running else "⚪ Stopped") + f" · port {cfg['port']}")
-            if running:
-                c1, c2 = st.columns(2)
-                if c1.button("⏹️ Stop", key=f"stop-{key}", use_container_width=True):
-                    with st.spinner(f"Stopping {cfg['label']}..."):
-                        stop_sap_system(key)
-                    st.rerun()
-                if c2.button("🔁 Restart", key=f"restart-{key}", use_container_width=True):
-                    with st.spinner(f"Restarting {cfg['label']}..."):
-                        if not restart_sap_system(key):
-                            st.error(f"Failed to restart — check {cfg['log']}")
-                    st.rerun()
-            else:
-                if st.button("▶️ Start", key=f"start-{key}", use_container_width=True):
-                    with st.spinner(f"Starting {cfg['label']}..."):
-                        if not start_sap_system(key):
-                            st.error(f"Failed to start — check {cfg['log']}")
-                    st.rerun()
-
-    st.divider()
-    st.caption(f"📁 `{PROJECT_DIR}`")
-    if st.button("🔄 New ticket / reset session", use_container_width=True):
-        st.session_state.session_id = None
-        st.session_state.ticket_key = None
-        st.session_state.iteration = 0
-        st.session_state.history = []
+    st.markdown("### Demo Connections")
+    st.caption("Session-only credentials. Writes require explicit confirmation.")
+    with st.expander("Jira Cloud", expanded=True):
+        st.text_input("Jira URL", placeholder="https://your-site.atlassian.net", key="demo_jira_url", on_change=reset_session)
+        st.text_input("Jira account email", placeholder="you@example.com", key="demo_jira_email", on_change=reset_session)
+        st.text_input("Jira API token", type="password", placeholder="Enter Jira API token", key="demo_jira_token", on_change=reset_session)
+    with st.expander("Wiki / Confluence", expanded=True):
+        st.text_input("Wiki URL", placeholder="https://your-site.atlassian.net/wiki", key="demo_wiki_url", on_change=reset_session)
+        st.text_input("Wiki account email", placeholder="you@example.com", key="demo_wiki_email", on_change=reset_session)
+        st.text_input("Wiki API token", type="password", placeholder="Enter Confluence API token", key="demo_wiki_token", on_change=reset_session)
+    with st.expander("LLM", expanded=True):
+        provider = st.selectbox("LLM provider", ["Anthropic", "OpenAI", "Azure OpenAI", "Google Gemini"], key="demo_llm_provider", on_change=reset_session)
+        st.text_input("LLM API token", type="password", placeholder="Enter provider API key", key="demo_llm_token", on_change=reset_session)
+        st.text_input("Model / deployment name", placeholder="claude-sonnet-4-5, gpt-4.1 or gemini-3.8-flash", key="demo_llm_model", on_change=reset_session)
+        if provider == "Azure OpenAI":
+            st.text_input("Azure OpenAI endpoint", placeholder="https://your-resource.openai.azure.com", key="demo_llm_endpoint", on_change=reset_session)
+        if st.button("Test LLM (API request)", key="test_llm", width="stretch"):
+            try:
+                with st.spinner("Checking LLM..."):
+                    generate_reply(connection_settings(), "Reply with OK only.", [], {})
+                st.success("LLM returned text successfully.")
+            except RuntimeError as error:
+                st.error(str(error))
+    if st.button("Clear connection settings", width="stretch"):
+        for connection_key in list(st.session_state):
+            if connection_key.startswith("demo_"):
+                del st.session_state[connection_key]
+        reset_session()
         st.rerun()
 
-# --- Ticket/wiki inputs (shown until code has actually been generated) ---
-if st.session_state.ticket_key is None:
-    with st.container(border=True, key="ticket-card"):
-        st.markdown("#### 🎫 Start a new ticket")
+    st.divider()
+    if st.button("🔄 New ticket / reset session", width="stretch"):
+        reset_session()
+        st.rerun()
+
+try:
+    validate_llm_settings(connection_settings())
+    chat_ready = True
+    generation_blocker = ""
+except RuntimeError as error:
+    chat_ready = False
+    generation_blocker = str(error)
+except ValueError:
+    chat_ready = False
+    generation_blocker = "The LLM endpoint URL is invalid."
+
+requirements_tab, code_tab = st.tabs(["Requirements", "Code generation"])
+
+with requirements_tab:
+    st.subheader("Requirements refinement")
+    st.markdown("#### 1. Fetch & summarize")
+    source_mode = st.segmented_control("Requirement source", ["Jira / wiki", "Pasted requirement"],
+                                       default="Jira / wiki", key="source_mode", on_change=reset_session)
+    if source_mode == "Jira / wiki":
         wiki_page = st.text_input(
             "Wiki / Confluence page (optional)",
-            placeholder="Page URL, ID, or title — leave blank to use the page linked from the ticket",
+            placeholder="Published page URL or numeric ID",
+            key="wiki_page",
+            on_change=reset_session,
         )
-        ticket_key = st.text_input("Jira ticket key", placeholder="e.g. ACIS-1234")
-        st.caption(
-            "Not sure yet, or just want to review the requirement first? Skip this and "
-            "ask about it in the chat below instead."
-        )
-        generate_clicked = st.button(
-            "✨ Generate code", type="primary", disabled=not ticket_key, use_container_width=True
-        )
-    if generate_clicked:
-        wiki_page = wiki_page.strip()
-        if wiki_page:
-            prompt = (
-                f"Generate SAP code for Jira ticket {ticket_key.strip()}. "
-                f"Fetch the ticket, then fetch this wiki/Confluence page for the design "
-                f"doc: {wiki_page}. Use it to ground the requirement even if it differs "
-                f"from (or isn't linked on) the ticket itself. Then follow the workflow "
-                f"and output structure in CLAUDE.md."
-            )
-        else:
-            prompt = (
-                f"Generate SAP code for Jira ticket {ticket_key.strip()}. "
-                f"Fetch the ticket and any linked wiki page first, then follow the "
-                f"workflow and output structure in CLAUDE.md."
-            )
-        st.session_state.ticket_key = ticket_key.strip()
-        send_message(prompt)
-else:
-    st.markdown(f"#### 🎫 Ticket: `{st.session_state.ticket_key}`")
+        ticket_key = st.text_input("Jira ticket key", placeholder="e.g. KAN-4", key="ticket_input",
+                                   on_change=reset_session).strip().upper()
+        if st.button("Test Jira / wiki", key="test_atlassian", disabled=not ticket_key, width="stretch"):
+            try:
+                with st.spinner("Fetching ticket and design through MCP..."):
+                    preview = fetch_context(connection_settings(), ticket_key, wiki_page.strip())
+                st.success(f"Read {ticket_key} and {len(preview['design_pages'])} design page(s).")
+                show_source(preview)
+            except RuntimeError as error:
+                st.error(str(error))
+        try:
+            validate_settings(connection_settings(), require_llm=False)
+            source_ready = bool(ticket_key)
+        except (RuntimeError, ValueError) as error:
+            source_ready = False
+            st.warning(str(error) if isinstance(error, RuntimeError) else "A source URL is invalid.")
+    else:
+        pasted = st.text_area("Raw requirement", height=180, key="pasted_requirement", on_change=reset_session)
+        source_ready = bool(pasted.strip())
+    if not chat_ready:
+        st.warning(f"Summarization unavailable: {generation_blocker}")
+    if st.button("Fetch & summarize", type="primary", key="summarize", disabled=not (chat_ready and source_ready)):
+        refine_message("Prepare a complete developer-ready specification from the supplied requirement. Return the full document, open questions and sources.", fetch=True)
 
-st.divider()
-
-# --- Conversation view (always visible) ---
-for i, msg in enumerate(st.session_state.history):
-    is_assistant = msg["role"] == "assistant"
-    avatar = "🤖" if is_assistant else "🧑‍💻"
-    with st.container(key=f"msg{i}-{'assistant' if is_assistant else 'user'}"):
-        with st.chat_message("assistant" if is_assistant else "user", avatar=avatar):
-            st.markdown(msg["text"])
-
-if st.session_state.get("last_saved"):
-    with st.container(key="saved-files"):
-        with st.expander("📁 Files saved this round"):
-            for p in st.session_state.last_saved:
-                st.code(p, language=None)
-        if st.button("📤 Push to abapGit repo", use_container_width=True):
-            ticket_or_session = st.session_state.ticket_key or "session"
-            with st.spinner("Converting and pushing to abapGit repo..."):
-                result = subprocess.run(
-                    ["python3", "export_to_abapgit.py", ticket_or_session, "--push"],
-                    cwd=PROJECT_DIR, capture_output=True, text=True,
-                )
-            if result.returncode == 0:
-                st.success("Pushed to abapGit repo")
+    st.markdown("#### 2. Refine with AI")
+    st.selectbox("Reviewing as", ["bsa", "qa", "developer"],
+                 format_func=lambda role: {"bsa": "BSA / Product Manager", "qa": "QA", "developer": "Developer"}[role], key="review_role")
+    for message in st.session_state.requirement_history:
+        with st.chat_message(message["role"]):
+            if message["role"] == "assistant":
+                show_spec(message["text"])
             else:
-                st.error("Push failed")
-            st.code((result.stdout + result.stderr).strip(), language=None)
+                st.markdown(message["text"])
+    if not chat_ready:
+        st.warning(f"Refinement unavailable: {generation_blocker}")
+    elif not st.session_state.requirement_draft and not source_ready:
+        st.info("Refinement unavailable: no requirement source or imported specification.")
+    refinement = st.chat_input("Refine the requirement", key="requirement_chat",
+                               disabled=not (chat_ready and (st.session_state.requirement_draft or source_ready)))
+    if refinement:
+        refine_message(refinement, fetch=not bool(st.session_state.requirement_draft))
 
-# --- Chat (always available — questions about the requirement/wiki/Jira/SAP
-# code, or feedback to revise generated code, all share the same session) ---
-chat_placeholder = (
-    "Ask about the requirement, wiki, or Jira ticket — or request code"
-    if st.session_state.session_id is None
-    else "Ask a question, or tell me what to fix (or say it looks good)"
-)
-user_msg = st.chat_input(chat_placeholder)
-if user_msg:
-    send_message(user_msg)
+    st.markdown("#### 3. Finalize / edit")
+    imported = st.file_uploader("Import a specification", type=["md", "txt"], key="import_spec")
+    if imported and st.button("Use imported specification", key="use_import"):
+        try:
+            if imported.size > 100000:
+                raise RuntimeError("The specification exceeds 100 KB.")
+            imported_document = imported.getvalue().decode("utf-8")
+            if not imported_document.strip():
+                raise RuntimeError("The imported specification is empty.")
+            reset_session()
+            st.session_state.requirement_draft = imported_document
+            st.session_state.requirement_iteration = 1
+            st.rerun()
+        except (UnicodeDecodeError, RuntimeError):
+            st.error("Import a UTF-8 markdown specification smaller than 100 KB.")
+    if st.session_state.requirement_draft:
+        editor_key = f"requirement_editor_{st.session_state.requirement_iteration}"
+        document = st.text_area("Requirement document", value=st.session_state.requirement_draft,
+                                height=320, key=editor_key, on_change=requirement_edited, args=(editor_key,))
+        approval_key = f"approve_{st.session_state.workspace_id}_{st.session_state.requirement_iteration}_" + hashlib.sha256(document.encode()).hexdigest()[:16]
+        approved = st.checkbox("I approve this specification for code generation", key=approval_key,
+                               on_change=approval_changed, args=(approval_key,))
+        if st.button("Finalize requirement", key="finalize", disabled=not approved) and approved:
+            finalize_requirement(document)
+    if st.session_state.final_requirement:
+        st.success("Finalized specification ready for code generation.")
+        st.download_button("Download specification", st.session_state.final_requirement,
+                           file_name=f"{st.session_state.ticket_key or 'requirement'}_spec.md", mime="text/markdown")
+        with st.expander("Publish finalized requirement"):
+            from demo_backend import publish_requirement
+            target = st.selectbox("Publish target", ["Jira comment", "Replace Jira description", "New Confluence page", "Update Confluence page"], key="publish_target")
+            publish_ticket = st.text_input("Publish Jira ticket", value=st.session_state.ticket_key or "", key="publish_ticket")
+            publish_title = st.text_input("Page title", key="publish_title")
+            publish_space = st.text_input("Confluence space key", key="publish_space")
+            publish_page = st.text_input("Existing page URL / ID", key="publish_page")
+            publish_parent = st.text_input("Parent page URL / ID (optional)", key="publish_parent")
+            publish_identity = json.dumps([target, publish_ticket, publish_title, publish_space, publish_page,
+                                           publish_parent, st.session_state.final_requirement])
+            confirm_key = "publish_confirm_" + hashlib.sha256(publish_identity.encode()).hexdigest()[:16]
+            confirmed = st.checkbox("I confirm the target and authorize this write", key=confirm_key)
+            if st.button("Publish requirement", key="publish", disabled=not confirmed) and confirmed:
+                try:
+                    with st.spinner("Publishing approved specification..."):
+                        publish_requirement(connection_settings(), target, st.session_state.final_requirement,
+                                            ticket=publish_ticket.strip().upper(), title=publish_title.strip(),
+                                            space=publish_space.strip(), page=publish_page.strip(), parent=publish_parent.strip())
+                    st.success("Requirement published successfully.")
+                except (RuntimeError, ValueError) as error:
+                    st.error(str(error) if isinstance(error, RuntimeError) else "Invalid publish target.")
+
+with code_tab:
+    st.subheader("Code generation")
+    if not st.session_state.final_requirement:
+        st.info("Finalize and approve a specification in Requirements before generating code.")
+    else:
+        with st.expander("Finalized requirement"):
+            show_spec(st.session_state.final_requirement)
+    if not chat_ready:
+        st.warning(f"Generation unavailable: {generation_blocker}")
+    if st.button("✨ Generate code", type="primary", key="generate", disabled=not (chat_ready and st.session_state.final_requirement)):
+        send_message("Generate the complete ABAP Cloud objects required by the finalized specification. Preserve scope and report unverified dependencies.")
+    for message in st.session_state.history:
+        with st.chat_message(message["role"]):
+            st.markdown(message["text"])
+    code_feedback = st.chat_input("Review or revise generated code", key="code_chat",
+                                  disabled=not (chat_ready and st.session_state.history))
+    if code_feedback:
+        send_message(code_feedback)
+    if st.session_state.get("last_saved"):
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+            for path in st.session_state.last_saved:
+                bundle.write(path, arcname=os.path.basename(path))
+        st.download_button("Download generated files", archive.getvalue(), file_name="generated_code.zip", mime="application/zip")
+        with st.expander("Generated files"):
+            for path in st.session_state.last_saved:
+                st.text(os.path.basename(path))

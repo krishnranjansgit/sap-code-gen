@@ -1,11 +1,12 @@
-# Machine-specific config written by setup.py -- never commit real values
+# Private local settings, including files left from the retired runtime
 .env
+.env.*
 sap_systems.json
+sap_rfc_systems.json
+user_repos.json
 
-# Vendored SAP RFC MCP server: its own venv + real credentials
-sap-rfc-mcp/.venv/
-sap-rfc-mcp/.env
-sap-rfc-mcp/__pycache__/
+# Retired connector's local credentials, dependencies and caches
+sap-rfc-mcp/
 
 # Generated code output (personal working files, not source)
 generated/*
@@ -14,10 +15,20 @@ generated/*
 # Python
 __pycache__/
 *.pyc
+*.pyo
 .venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
 
 # Streamlit
 .streamlit/secrets.toml
+.streamlit/secrets.*.toml
 
 # macOS
 .DS_Store

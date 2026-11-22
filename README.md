@@ -1,143 +1,110 @@
-# SAP Code Generator — Claude Code version
+# SAP Code Generator
 
-No API key needed. Uses your Claude Pro/Max/Team/Enterprise subscription
-via Claude Code, and drives Jira, Confluence, and SAP (both table reads and
-ABAP source/object access) through MCP connectors.
+External Jira Cloud / Confluence requirements refinement and SAP ABAP
+Cloud code generation, with separate requirement and code conversations.
 
-Two ways to use this:
-- **`app.py`** — a browser UI (recommended if you don't want a terminal)
-- **`/gen-sap-code` slash command** — for the terminal, if you ever want it
+## Run locally
 
-## One-time setup
+Use Python 3.13+ in a virtual environment:
 
-1. **Prerequisites**: Python **3.10+** (required by Streamlit/the MCP SDK —
-   check with `python3 --version`), plus `git` and `gh` (GitHub CLI,
-   authenticated — `gh auth status`). Install Claude Code if you haven't
-   already.
-
-2. **Clone this repo**, then run the interactive setup:
-   ```bash
-   git clone <this-repo-url>
-   cd sap-code-gen
-   python3 setup.py
-   ```
-   This walks you through everything below and wires it up automatically:
-   - Your Claude Code OAuth token
-   - Jira/Confluence (registers `mcp-atlassian`)
-   - The vendored SAP RFC MCP server (`sap-rfc-mcp/`) for table reads
-   - One or more SAP systems for ABAP source/object access (clones and
-     configures [abap-accelerator](https://github.com/aws-solutions-library-samples/guidance-for-deploying-sap-abap-accelerator-for-amazon-q-developer))
-   - Your abapGit target repo (creates a private GitHub repo via `gh`, or
-     points at an existing one)
-   - Personalizes `CLAUDE.md` with your custom ABAP object naming prefix
-
-   It's safe to re-run — each section can be skipped if already configured,
-   and you can re-run it later just to add another SAP system.
-
-   **One thing `setup.py` can't automate**: PyRFC needs SAP's NW RFC SDK,
-   which is behind an SAP support portal login. See
-   `sap-rfc-mcp/README.md` for that one manual step — do it before running
-   `setup.py`'s SAP RFC section, or come back and re-run that section after.
-
-3. Install the UI's dependencies:
-   ```bash
-   pip install -r requirements.txt --break-system-packages
-   ```
-
-4. Open a **new terminal** (so your OAuth token loads from your shell
-   profile), then confirm everything registered correctly:
-   ```bash
-   claude mcp list
-   ```
-
-## Using the UI
-
-From inside the project folder:
-```bash
-streamlit run app.py
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+streamlit run app.py --server.address 127.0.0.1 --server.port 8502
 ```
 
-This opens a browser tab. The sidebar shows environment status (token set?
-which SAP systems are running?) with **Start/Stop/Restart** controls for
-each configured SAP system — nothing auto-starts, so start what you need.
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) for `uvx`.
+The app launches `mcp-atlassian==0.24.6` in a temporary directory; the first
+local request downloads connector dependencies. The Docker image instead
+installs a dedicated connector environment at build time.
 
-From there:
-1. Enter a Jira ticket key (and optionally a Confluence page) and click
-   **Generate code** — or skip this and just ask about the requirement in
-   the chat first if you're not ready to generate yet.
-2. Claude fetches the ticket, pulls in any linked/specified wiki doc,
-   classifies it as ABAP or Fiori/UI5, and generates the code.
-3. Test it. Type feedback in the chat box (a test failure, a pattern to
-   use instead, anything wrong) and press enter. Claude revises the same
-   code — full conversation history is preserved via the session, so
-   it's editing what it actually wrote, not starting over.
-4. Repeat step 3 as many times as you like.
-5. Click **New ticket / reset session** in the sidebar to start on a
-   different ticket.
+## Requirements workflow
 
-Every round's files are saved under `generated/<ticket-key>/`, named
-`v1_...`, `v2_...`, etc. — nothing gets overwritten, so you can always go
-back to an earlier version. An expander under the chat shows exactly
-which files were saved each round.
+1. Enter your individual model API key and model/deployment name in the
+   sidebar. Anthropic, OpenAI, Azure OpenAI and Google Gemini are supported. Azure also needs
+   its resource endpoint; API version is `2024-10-21`. Web subscriptions do
+   not guarantee API access or quota. The test button consumes API quota and may be billable.
+   For Google, select **Google Gemini**, enter a key from
+   [Google AI Studio](https://aistudio.google.com/api-keys), and a text model
+   such as `gemini-3.5-flash-lite`. Requests use Google's fixed OpenAI-compatible
+   endpoint through the existing OpenAI SDK; no additional dependency is needed.
+   Check [current pricing](https://aistudio.google.com/docs/pricing) and your
+   project's model access and quotas. Free-tier content may be used to improve
+   Google's products; submit only synthetic/demo data under those terms.
+2. In **Requirements**, choose Jira/wiki or paste a raw requirement. Jira/wiki
+   needs site URLs, account emails and ordinary Atlassian Cloud API tokens
+   supported by site-based authentication. Use a Confluence base URL ending
+   in `/wiki`, a ticket such as `KAN-4`, and optionally a published page URL
+   or numeric ID. Linked design pages are followed when no page is specified.
+3. **Fetch & summarize** produces a sectioned specification. Review as BSA /
+   Product Manager, QA or Developer, and refine it in the requirement chat.
+   The role focus, requirements persona, code-generation persona and section
+   template are exact snapshots from `sap-ai-codegen-platform-personal`.
+   Separate external-cloud policies constrain those prompts to this app's
+   actual capabilities; the reference repository is not a runtime dependency.
+4. Edit the complete specification directly, or import a UTF-8 `.md`/`.txt`
+   specification up to 100 KB. Explicitly approve and **Finalize requirement**.
+   Generation uses the actual finalized editor text, not the original ticket.
+   Manual edits, refinement, imports, source/account changes and approval
+   withdrawal invalidate previously approved code and saved-file links.
+5. Optionally publish the finalized spec as a Jira comment, replace a Jira
+   description, create a Confluence page or update one. Enter a separate
+   destination and explicitly authorize the write. Updating replaces content;
+   changing document/target resets confirmation. Generation never has write
+   tools. Verify the destination before retrying a timed-out publication.
+6. In **Code generation**, generate, review and revise complete code files
+   using its independent conversation. Download a ZIP and the finalized spec.
 
-## Pushing generated code to abapGit
+Pasted/imported specifications need only model settings; publishing still
+requires configured Atlassian credentials with destination write permissions.
+No local filesystem/repository picker or Git/SAP deployment control is exposed.
 
-Once you're happy with a round, click **📤 Push to abapGit repo** (next to
-"Files saved this round"). This converts the latest generated files into
-the format abapGit expects (`<name>.prog.abap`/`.xml` for reports,
-`<name>.clas.abap`/`.xml` for classes, `<name>.tabl.xml`/`.struc.xml` for
-tables/structures — see `CLAUDE.md` for the plain-text format Claude uses
-to describe a dictionary object) and pushes them to whatever local path
-you configured as `ABAPGIT_REPO_DIR` during setup. Object types beyond
-these aren't auto-converted — the button's output will list anything
-skipped so you can handle it manually.
+## Connections and data
 
-**Dictionary object (table/structure) conversion is best-effort**,
-especially for fields using an inline built-in type (`CHAR20`, `DEC15.2`,
-etc.) rather than referencing an existing data element — do a trial
-pull + activate in SAP before trusting this for a real deliverable.
+Credentials are masked and held only in the server's Streamlit session, not
+written to `.env` or configuration files. Clearing connection settings removes
+credentials, context and saved-file links, not files already on disk. Each
+browser session has a separate random artifact directory. Model requests
+contain requirements and conversation text, not the connection settings.
+Use only public/synthetic material authorized for your selected provider.
 
-From there, use **zabapgit** in your SAP system to pull from that repo
-into a package. Two things worth checking on the SAP side before your
-first pull:
-- Your SAP system needs outbound network access to `github.com`.
-- If the repo is private, the SAP HTTP connection zabapgit uses needs a
-  GitHub personal access token (not your GitHub password) configured for
-  authentication.
+The app does not connect to SAP and requires no SAP endpoint or access token.
+Download generated files and import them into your SAP system manually.
+No ABAP source grounding, syntax check, ATC, activation, execution or deployment
+is performed; verify those separately in Eclipse ADT after import.
+Classic RFC/ALV and unreleased-table assumptions are excluded from generation.
 
-Pushing is deliberately **not** available by just asking Claude in chat —
-only the button (or running `export_to_abapgit.py --push` yourself) does
-it. Claude can still check what's already there read-only, e.g. "what's
-in the abapGit repo?"
+Outputs are versioned under `generated/<session-id>/<ticket-or-session>/` by
+default, or under `ARTIFACT_DIR`. Sessions and local container files are not
+durable; download your work. Legacy SAP connection, abapGit export and local
+credential-setup utilities have been removed. No `.env` file is required.
 
-## Using the terminal version instead
+## Docker and Google Cloud
 
-If you'd rather type in a terminal on a given day, the same project still
-works there — just run `claude` from inside the folder and either type
-`/gen-sap-code ACIS-1234` or describe the ticket in plain language.
+See [DEPLOYMENT.md](DEPLOYMENT.md) for non-root Docker packaging, private
+Cloud Run commands, authenticated external access and WebSocket/session
+limitations. Authentication, quotas, durable per-user storage and retention
+are required before a production multi-user launch.
 
-## Adding another SAP system later
+## Tests
 
-Re-run `python3 setup.py` — it'll skip sections already configured and
-let you add another entry to the "ABAP Accelerator" section. Each system
-gets its own instance folder, port, and MCP server registration
-(`abap-accelerator-<key>`), and shows up as its own card in the sidebar.
+```sh
+python3 -m unittest test_demo_backend -v
+```
 
-## Notes
+Tests mock external providers and MCP calls. Passing tests does not establish
+live credential access or generated SAP object activation.
 
-- Because this runs through your subscription, keep it to your own
-  individual use (per Anthropic's usage policy) — this isn't a setup for
-  routing other people's requests through your seat.
-- `ALLOWED_TOOLS` in `app.py` is deliberately scoped to just the tools this
-  workflow needs, built from `.env`/`sap_systems.json` rather than
-  hardcoded names. Headless runs can't show interactive permission
-  prompts, so this list is what keeps a run from silently trying — and
-  failing — to use something broader. Widen it only if you add tools
-  this workflow genuinely needs.
-- `.env` and `sap_systems.json` are gitignored (they're generated by
-  `setup.py` and contain machine-specific paths/credentials) — the
-  `.example` counterparts are what's actually committed.
-- If you ever want this to also work without any interactive Claude Code
-  session (e.g. triggered from a script or CI, or centrally hosted for a
-  team), that's a different setup using the Claude Agent SDK with an API
-  key — a separate effort from this local, per-person setup.
+## Repository contents
+
+- `app.py`: Streamlit requirements, approval, code generation and downloads.
+- `demo_backend.py`: session-scoped Atlassian MCP and model API calls.
+- `prompts.py`: requirements and code-generation prompts.
+- `test_demo_backend.py`: mocked backend and Streamlit workflow regressions.
+- `Dockerfile`, `.dockerignore`, `.gcloudignore`, `DEPLOYMENT.md`: deployment packaging.
+
+Private connection files, generated downloads, logs and local dependencies are
+ignored by Git. Before publishing, review `git status --short` and the staged
+diff for secrets. Ignore rules do not remove secrets from existing Git history;
+rotate any previously committed credentials and address that history separately.

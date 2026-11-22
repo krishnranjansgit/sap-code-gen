@@ -1,0 +1,7 @@
+**
+!Dockerfile
+!.dockerignore
+!requirements.txt
+!app.py
+!demo_backend.py
+!prompts.py
