@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from streamlit.testing.v1 import AppTest
 
 import demo_backend as backend
+import prompts
 
 
 SETTINGS = {
@@ -24,6 +25,24 @@ SETTINGS = {
     "demo_llm_model": "gpt-4.1",
 }
 REPLY = "## Ticket Summary\nDemo\n## Classification\nABAP\n## Code\n```abap\n* Z_DEMO.clas.abap\nCLASS z_demo DEFINITION PUBLIC.\nENDCLASS.\n```\n## Notes\nNot activated."
+
+
+class PromptTests(unittest.TestCase):
+    def test_requirements_include_shared_security_and_reference_persona(self):
+        for role, focus in prompts.REQUIREMENTS_ROLE_FOCUS.items():
+            with self.subTest(role=role):
+                system_prompt = prompts.requirements_prompt(role)
+                self.assertTrue(system_prompt.startswith(prompts.BASE_SECURITY_SYSTEM_PROMPT + "\n\n"))
+                self.assertIn(prompts.SAP_REQUIREMENTS_PERSONA, system_prompt)
+                self.assertIn(focus, system_prompt)
+                self.assertTrue(system_prompt.endswith(prompts.EXTERNAL_CLOUD_POLICY))
+
+    def test_codegen_includes_shared_security_and_reference_persona(self):
+        system_prompt = prompts.codegen_prompt()
+        self.assertTrue(system_prompt.startswith(prompts.BASE_SECURITY_SYSTEM_PROMPT + "\n\n"))
+        self.assertIn(prompts.SAP_CODE_GEN_PERSONA, system_prompt)
+        self.assertIn(prompts.EXTERNAL_CLOUD_POLICY, system_prompt)
+        self.assertTrue(system_prompt.endswith(prompts.CODE_OUTPUT_POLICY))
 
 
 class BackendTests(unittest.TestCase):
